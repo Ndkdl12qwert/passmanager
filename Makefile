@@ -1,6 +1,7 @@
 SHELL := /usr/bin/env bash
 
-.PHONY: all build test integration docs clean
+.PHONY: all build test integration docs clean release
+
 all: build
 
 build:
@@ -8,17 +9,18 @@ build:
 
 test:
 	go test ./pkg/...
-
+	./tests/run_tests.shell
 
 integration:
-	chmod +x ./tests/run_tests.sh ./tests/integration.sh
-	./tests/run_tests.sh
 	./tests/integration.sh
 
 docs:
 	@echo "Documentation files:"
 	@find docs -maxdepth 1 -type f | sort
 
-clean:
-	rm -f bin/passman bin/pass
+release:
+	./release --clean
 
+clean:
+	rm -f bin/passmanager bin/pass
+	rm -rf release/

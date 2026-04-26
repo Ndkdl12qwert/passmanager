@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION=""
+PLATFORMS=()
+DRAFT=false
+PRE_RELEASE=false
+SKIP_GIT=false
+SKIP_UPLOAD=false
+PARALLEL=4
+RELEASE_DIR="release"
+CLEAN=false
+
+show_help() {
+    cat <<EOF
+Usage: $0 [options] [VERSION]
+
+Options:
+  --version=VERSION    Set release version (default: auto from git)
+  --platform=GOOS      Target platform (can be repeated, default: linux,darwin,windows)
+  --draft              Create GitHub release as draft
+  --pre-release        Mark as pre-release
+  --skip-git           Skip git tag creation and push
+  --skip-upload        Skip GitHub release upload (only build artifacts)
+  --parallel=N         Number of parallel builds (default: 4)
+  --clean              Remove release directory before building
+  --help               Show this help
+
+Examples:
+  $0 v1.2.3
+  $0 --platform=linux --platform=darwin --draft v1.2.3
+  $0 --skip-upload --clean v1.2.3
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --version=*)
+            VERSION="${1#*=}"
+            shift
+            ;;
+        --platform=*)
+            PLATFORMS+=("${1#*=}")
+            shift
+            ;;
+        --draft)
+            DRAFT=true
+            shift
+            ;;
+        --pre-release)
+            PRE_RELEASE=true
+            shift
+            ;;
+        --skip-git)
+            SKIP_GIT=true
+            shift
+            ;;
+        --skip-upload)
+            SKIP_UPLOAD=true
+            shift
+            ;;
+        --parallel=*)
+            PARALLEL="${1#*=}"
+            shift
+            ;;
+        --clean)
+            CLEAN=true
+            shift
+            ;;
+        --help)
+            show_help
+            exit 0
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+        *)
+            if [[ -z "$VERSION" ]]; then
+                VERSION="$1"
+            else
+                echo "Warning: ignoring extra argument: $1" >&2
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$VERSION" ]]; then
+    if git describe --tags --exact-match 2>/dev/null; then
+        VERSION=$(git describe --tags --exact-match)
+    else
+        LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+        COMMIT_COUNT=$(git rev-list --count HEAD)
+        VERSION="${LATEST_TAG}+${COMMIT_COUNT}"
+        echo "Auto-detected version: $VERSION"
+    fi
+fi
+
+if [[ "$VERSION" != v* ]]; then
+    VERSION="v$VERSION"
+fi
+
+declare -A ARCH_MAP=(
+    [linux]="amd64 arm64"
+    [darwin]="amd64 arm64"
+    [windows]="amd64"
+)
+
+if [[ ${#PLATFORMS[@]} -eq 0 ]]; then
+    PLATFORMS=(linux darwin windows)
+fi
+
+RELEASE_ARTIFACTS_DIR="$RELEASE_DIR/$VERSION"
+if [[ "$CLEAN" == true && -d "$RELEASE_ARTIFACTS_DIR" ]]; then
+    rm -rf "$RELEASE_ARTIFACTS_DIR"
+fi
+mkdir -p "$RELEASE_ARTIFACTS_DIR"
+
+BUILD_TEMP_DIR=$(mktemp -d)
+trap 'rm -rf "$BUILD_TEMP_DIR"' EXIT
+
+build_one() {
+    local goos=$1
+    local goarch=$2
+    local out_name="passmanager-${goos}-${goarch}"
+    [[ "$goos" == "windows" ]] && out_name+=".exe"
+    local out_path="$BUILD_TEMP_DIR/$out_name"
+
+    echo "Building $goos/$goarch ..."
+    if GOOS="$goos" GOARCH="$goarch" go build -o "$out_path" ./cmd/passmanager; then
+        echo "  -> $out_path"
+    else
+        echo "  FAILED: $goos/$goarch" >&2
+        return 1
+    fi
+}
+export -f build_one
+export BUILD_TEMP_DIR
+
+declare -a JOBS=()
+for goos in "${PLATFORMS[@]}"; do
+    for goarch in ${ARCH_MAP[$goos]}; do
+        JOBS+=("$goos:$goarch")
+    done
+done
+
+echo "Starting parallel builds (max $PARALLEL)..."
+printf "%s\n" "${JOBS[@]}" | xargs -P "$PARALLEL" -I {} bash -c 'IFS=: read -r goos goarch <<< "{}"; build_one "$goos" "$goarch"'
+
+echo "Packaging artifacts..."
+cd "$BUILD_TEMP_DIR"
+
+for file in passmanager-*; do
+    [[ -e "$file" ]] || continue
+    cp "$file" "$RELEASE_ARTIFACTS_DIR/"
+    if [[ "$file" == *.exe ]]; then
+        zip -q "${RELEASE_ARTIFACTS_DIR}/${file%.exe}.zip" "$file"
+    else
+        tar -czf "${RELEASE_ARTIFACTS_DIR}/${file}.tar.gz" "$file"
+    fi
+done
+
+cd "$RELEASE_ARTIFACTS_DIR"
+sha256sum passmanager-* > SHA256SUMS
+echo "Checksums saved to SHA256SUMS"
+
+if [[ "$SKIP_GIT" == false ]]; then
+    if git rev-parse "$VERSION" >/dev/null 2>&1; then
+        echo "Tag $VERSION already exists, skipping creation."
+    else
+        echo "Creating git tag $VERSION ..."
+        git tag -a "$VERSION" -m "Release $VERSION"
+        git push origin "$VERSION"
+    fi
+fi
+
+if [[ "$SKIP_UPLOAD" == false ]]; then
+    if ! command -v gh &>/dev/null; then
+        echo "Warning: GitHub CLI 'gh' not found. Skipping release upload."
+        SKIP_UPLOAD=true
+    fi
+fi
+
+if [[ "$SKIP_UPLOAD" == false ]]; then
+    echo "Creating GitHub release..."
+    GH_ARGS=()
+    [[ "$DRAFT" == true ]] && GH_ARGS+=(--draft)
+    [[ "$PRE_RELEASE" == true ]] && GH_ARGS+=(--prerelease)
+    gh release create "$VERSION" --title "$VERSION" --notes "Release $VERSION" "${GH_ARGS[@]}" || true
+    gh release upload "$VERSION" ./*.tar.gz ./*.zip SHA256SUMS --clobber
+    echo "Release URL: https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/releases/tag/$VERSION"
+fi
+
+echo "✅ Release artifacts ready in $RELEASE_ARTIFACTS_DIR"
+ls -lh "$RELEASE_ARTIFACTS_DIR"

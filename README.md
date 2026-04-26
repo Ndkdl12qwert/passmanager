@@ -1,4 +1,5 @@
-# Passman
+# A project entirely completed by AI
+# Passmanager
 
 A secure password manager written in Go with a command-line interface.
 
